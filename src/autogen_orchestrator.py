@@ -13,6 +13,8 @@ Workflow:
 
 import logging
 import asyncio
+import concurrent.futures
+import re
 from typing import Dict, Any, List, Optional
 
 from src.agents.autogen_agents import create_research_team
@@ -36,13 +38,6 @@ class AutoGenOrchestrator:
         """
         self.config = config
         self.logger = logging.getLogger("autogen_orchestrator")
-        
-        # Create the research team
-        self.logger.info("Creating research team...")
-        self.team = create_research_team(config)
-        
-        self.logger.info("Research team created successfully")
-        
         # Workflow trace for debugging and UI display
         self.workflow_trace: List[Dict[str, Any]] = []
 
@@ -64,22 +59,27 @@ class AutoGenOrchestrator:
         self.logger.info(f"Processing query: {query}")
         
         try:
-            # Run the async query processing
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # If we're already in an async context, create a new loop
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    result = pool.submit(
-                        asyncio.run, 
-                        self._process_query_async(query, max_rounds)
-                    ).result()
-            else:
-                result = loop.run_until_complete(self._process_query_async(query, max_rounds))
+            # Always run in a dedicated thread with its own event loop.
+            # asyncio.get_event_loop() raises RuntimeError in Streamlit's
+            # ScriptRunner thread (Python 3.10+), so we never call it.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                result = pool.submit(
+                    asyncio.run,
+                    self._process_query_async(query, max_rounds)
+                ).result(timeout=180)
             
             self.logger.info("Query processing complete")
             return result
             
+        except (TimeoutError, concurrent.futures.TimeoutError):
+            self.logger.error("Query processing timed out after 180 seconds")
+            return {
+                "query": query,
+                "error": "Request timed out",
+                "response": "The research query took too long to process. Please try a simpler or more specific question.",
+                "conversation_history": [],
+                "metadata": {"error": True, "timeout": True}
+            }
         except Exception as e:
             self.logger.error(f"Error processing query: {e}", exc_info=True)
             return {
@@ -101,6 +101,10 @@ class AutoGenOrchestrator:
         Returns:
             Dictionary containing results
         """
+        # Create a fresh team per query so its internal asyncio queues are
+        # bound to the current event loop, not one from a previous request.
+        team = create_research_team(self.config)
+
         # Create task message
         task_message = f"""Research Query: {query}
 
@@ -109,16 +113,22 @@ Please work together to answer this query comprehensively:
 2. Researcher: Gather evidence from web and academic sources
 3. Writer: Synthesize findings into a well-cited response
 4. Critic: Evaluate the quality and provide feedback"""
-        
+
         # Run the team
-        result = await self.team.run(task=task_message)
+        result = await team.run(task=task_message)
         
         # Extract conversation history
         messages = []
-        async for message in result.messages:
+        for message in result.messages:
+            content = message.content if hasattr(message, 'content') else str(message)
+            if isinstance(content, list):
+                content = " ".join([item.get("text", str(item)) if isinstance(item, dict) else str(item) for item in content])
+            elif content is None:
+                content = ""
+            content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
             msg_dict = {
                 "source": message.source,
-                "content": message.content if hasattr(message, 'content') else str(message),
+                "content": content,
             }
             messages.append(msg_dict)
         
@@ -174,6 +184,10 @@ Please work together to answer this query comprehensively:
             num_sources += finding.count("\n1.") + finding.count("\n2.") + finding.count("\n3.")
         
         # Clean up final response
+        if isinstance(final_response, list):
+            final_response = " ".join([item.get("text", str(item)) if isinstance(item, dict) else str(item) for item in final_response])
+        elif not isinstance(final_response, str):
+            final_response = str(final_response) if final_response else ""
         if final_response:
             final_response = final_response.replace("TERMINATE", "").strip()
         

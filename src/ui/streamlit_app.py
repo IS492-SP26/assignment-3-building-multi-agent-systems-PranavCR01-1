@@ -1,400 +1,483 @@
 """
-Streamlit Web Interface
-Web UI for the multi-agent research system.
-
+Streamlit Web Interface — Multi-Agent Research System
 Run with: streamlit run src/ui/streamlit_app.py
 """
 
 import sys
+import re
+import html as html_lib
+import asyncio
 from pathlib import Path
+from datetime import datetime
+from typing import Dict, Any, List
 
-# Add project root to Python path
+# Add project root to path so imports work
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 import streamlit as st
-import asyncio
 import yaml
-from datetime import datetime
-from typing import Dict, Any
 from dotenv import load_dotenv
 
 from src.autogen_orchestrator import AutoGenOrchestrator
+from src.guardrails.safety_manager import SafetyManager
 
-# Load environment variables
-load_dotenv()
+load_dotenv(override=True)
 
+# ---------------------------------------------------------------------------
+# Agent colour map for traces
+# ---------------------------------------------------------------------------
+AGENT_COLORS = {
+    "Planner":    ("#1e3a5f", "#d0e8ff"),   # dark blue / light blue
+    "Researcher": ("#1e4f2e", "#d4f5dc"),   # dark green / light green
+    "Writer":     ("#4a2060", "#ecdcff"),   # dark purple / light purple
+    "Critic":     ("#5c2a00", "#ffe8cc"),   # dark orange / light orange
+    "default":    ("#333333", "#f0f0f0"),
+}
 
-def load_config():
-    """Load configuration file."""
-    config_path = Path("config.yaml")
-    if config_path.exists():
-        with open(config_path, 'r') as f:
+# ---------------------------------------------------------------------------
+# Config / session helpers
+# ---------------------------------------------------------------------------
+
+def load_config() -> Dict[str, Any]:
+    p = project_root / "config.yaml"
+    if p.exists():
+        with open(p, "r", encoding="utf-8") as f:
             return yaml.safe_load(f)
     return {}
 
 
-def initialize_session_state():
-    """Initialize Streamlit session state."""
-    if 'history' not in st.session_state:
-        st.session_state.history = []
+def init_session():
+    """Set up all session-state keys on first load."""
+    if "history" not in st.session_state:
+        st.session_state.history: List[Dict] = []
+    if "show_traces" not in st.session_state:
+        st.session_state.show_traces = False
+    if "show_safety_log" not in st.session_state:
+        st.session_state.show_safety_log = True
 
-    if 'orchestrator' not in st.session_state:
+    if "orchestrator" not in st.session_state:
         config = load_config()
-        # Initialize AutoGen orchestrator
         try:
             st.session_state.orchestrator = AutoGenOrchestrator(config)
-        except Exception as e:
-            st.error(f"Failed to initialize orchestrator: {e}")
+        except Exception as exc:
             st.session_state.orchestrator = None
+            st.session_state.orchestrator_error = str(exc)
 
-    if 'show_traces' not in st.session_state:
-        st.session_state.show_traces = False
+    if "safety_manager" not in st.session_state:
+        config = load_config()
+        st.session_state.safety_manager = SafetyManager(config.get("safety", {}))
 
-    if 'show_safety_log' not in st.session_state:
-        st.session_state.show_safety_log = False
 
-async def process_query(query: str) -> Dict[str, Any]:
-    """
-    Process a query through the orchestrator.
-    
-    Args:
-        query: Research query to process
-        
-    Returns:
-        Result dictionary with response, citations, and metadata
-    """
-    orchestrator = st.session_state.orchestrator
-    
-    if orchestrator is None:
+# ---------------------------------------------------------------------------
+# Core processing
+# ---------------------------------------------------------------------------
+
+def process_query(query: str) -> Dict[str, Any]:
+    """Run safety check → agent pipeline → output safety check."""
+    sm: SafetyManager = st.session_state.safety_manager
+    orch: AutoGenOrchestrator = st.session_state.orchestrator
+
+    # --- Input safety ---
+    input_check = sm.check_input_safety(query)
+    if not input_check["safe"]:
         return {
             "query": query,
-            "error": "Orchestrator not initialized",
-            "response": "Error: System not properly initialized. Please check your configuration.",
+            "blocked": True,
+            "response": sm.violation_message,
             "citations": [],
-            "metadata": {}
+            "metadata": {},
+            "safety_events": sm.get_safety_events()[-5:],
+            "input_violations": input_check["violations"],
         }
-    
+
+    if orch is None:
+        error_msg = getattr(st.session_state, "orchestrator_error", "Orchestrator not initialised")
+        return {
+            "query": query,
+            "error": error_msg,
+            "response": f"System error: {error_msg}",
+            "citations": [],
+            "metadata": {},
+        }
+
+    # --- Agent pipeline ---
     try:
-        # Process query through AutoGen orchestrator
-        result = orchestrator.process_query(query)
-        
-        # Check for errors
-        if "error" in result:
-            return result
-        
-        # Extract citations from conversation history
-        citations = extract_citations(result)
-        
-        # Extract agent traces for display
-        agent_traces = extract_agent_traces(result)
-        
-        # Format metadata
-        metadata = result.get("metadata", {})
-        metadata["agent_traces"] = agent_traces
-        metadata["citations"] = citations
-        metadata["critique_score"] = calculate_quality_score(result)
-        
+        result = orch.process_query(input_check["query"])
+    except Exception as exc:
         return {
             "query": query,
-            "response": result.get("response", ""),
-            "citations": citations,
-            "metadata": metadata
-        }
-        
-    except Exception as e:
-        return {
-            "query": query,
-            "error": str(e),
-            "response": f"An error occurred: {str(e)}",
+            "error": str(exc),
+            "response": f"Agent pipeline error: {exc}",
             "citations": [],
-            "metadata": {"error": True}
+            "metadata": {},
         }
 
+    response_text = re.sub(r'<think>.*?</think>', '', result.get("response", ""), flags=re.DOTALL).strip()
 
-def extract_citations(result: Dict[str, Any]) -> list:
-    """Extract citations from research result."""
-    citations = []
-    
-    # Look through conversation history for citations
+    # --- Output safety ---
+    sources = result.get("metadata", {}).get("sources", [])
+    output_check = sm.check_output_safety(response_text, sources)
+    final_response = output_check.get("response", response_text)
+
+    # --- Enrich metadata ---
+    metadata = result.get("metadata", {})
+    metadata["agent_traces"] = _build_traces(result)
+    metadata["critique_score"] = _quality_score(result)
+    metadata["output_action"] = output_check.get("action_taken", "none")
+    metadata["output_violations"] = output_check.get("violations", [])
+
+    return {
+        "query": query,
+        "response": final_response,
+        "citations": _extract_citations(result),
+        "metadata": metadata,
+        "safety_events": sm.get_safety_events()[-10:],
+        "blocked": False,
+    }
+
+
+def _extract_citations(result: Dict) -> List[str]:
+    citations: List[str] = []
     for msg in result.get("conversation_history", []):
         content = msg.get("content", "")
-        
-        # Find URLs in content
-        import re
-        urls = re.findall(r'https?://[^\s<>"{}|\\^`\[\]]+', content)
-        
-        # Find citation patterns like [Source: Title]
-        citation_patterns = re.findall(r'\[Source: ([^\]]+)\]', content)
-        
-        for url in urls:
-            if url not in citations:
-                citations.append(url)
-        
-        for citation in citation_patterns:
-            if citation not in citations:
-                citations.append(citation)
-    
-    return citations[:10]  # Limit to top 10
+        if isinstance(content, list):
+            content = " ".join([str(c) for c in content])
+        elif not isinstance(content, str):
+            content = str(content)
+        urls = re.findall(r"https?://[^\s<>\"{}|\\^`\[\]]+", content)
+        patterns = re.findall(r"\[Source:\s*([^\]]+)\]", content)
+        for u in urls:
+            if u not in citations:
+                citations.append(u)
+        for p in patterns:
+            label = p.strip()
+            if label and label not in citations:
+                citations.append(label)
+    return citations[:12]
 
 
-def extract_agent_traces(result: Dict[str, Any]) -> Dict[str, list]:
-    """Extract agent execution traces from conversation history."""
-    traces = {}
-    
+def _build_traces(result: Dict) -> List[Dict]:
+    """Return ordered list of {agent, content} for the conversation."""
+    traces = []
     for msg in result.get("conversation_history", []):
-        agent = msg.get("source", "Unknown")
-        content = msg.get("content", "")[:200]  # First 200 chars
-        
-        if agent not in traces:
-            traces[agent] = []
-        
-        traces[agent].append({
-            "action_type": "message",
-            "details": content
+        traces.append({
+            "agent": msg.get("source", "Unknown"),
+            "content": msg.get("content", ""),
         })
-    
     return traces
 
 
-def calculate_quality_score(result: Dict[str, Any]) -> float:
-    """Calculate a quality score based on various factors."""
-    score = 5.0  # Base score
-    
-    metadata = result.get("metadata", {})
-    
-    # Add points for sources
-    num_sources = metadata.get("num_sources", 0)
-    score += min(num_sources * 0.5, 2.0)
-    
-    # Add points for critique
-    if metadata.get("critique"):
-        score += 1.0
-    
-    # Add points for conversation length (indicates thorough discussion)
-    num_messages = metadata.get("num_messages", 0)
-    score += min(num_messages * 0.1, 2.0)
-    
-    return min(score, 10.0)  # Cap at 10
+def _quality_score(result: Dict) -> float:
+    meta = result.get("metadata", {})
+    score = 5.0
+    score += min(meta.get("num_sources", 0) * 0.4, 2.0)
+    if meta.get("critique"):
+        score += 0.8
+    score += min(meta.get("num_messages", 0) * 0.08, 2.2)
+    return round(min(score, 10.0), 1)
 
 
-def display_response(result: Dict[str, Any]):
-    """
-    Display query response.
+# ---------------------------------------------------------------------------
+# Display helpers
+# ---------------------------------------------------------------------------
 
-    TODO: YOUR CODE HERE
-    - Format response nicely
-    - Show citations with links
-    - Display sources
-    - Show safety events if any
-    """
-    # Check for errors
-    if "error" in result:
-        st.error(f"Error: {result['error']}")
-        return
-
-    # Display response
-    st.markdown("### Response")
-    response = result.get("response", "")
-    st.markdown(response)
-
-    # Display citations
-    citations = result.get("citations", [])
-    if citations:
-        with st.expander("📚 Citations", expanded=False):
-            for i, citation in enumerate(citations, 1):
-                st.markdown(f"**[{i}]** {citation}")
-
-    # Display metadata
-    metadata = result.get("metadata", {})
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Sources Used", metadata.get("num_sources", 0))
-    with col2:
-        score = metadata.get("critique_score", 0)
-        st.metric("Quality Score", f"{score:.2f}")
-
-    # Safety events
-    safety_events = metadata.get("safety_events", [])
-    if safety_events:
-        with st.expander("⚠️ Safety Events", expanded=True):
-            for event in safety_events:
-                event_type = event.get("type", "unknown")
-                action = event.get("action", "allow")
-                violations = event.get("violations", [])
-                st.warning(
-                    f"{event_type.upper()} ({action.upper()}): "
-                    f"{len(violations)} violation(s) detected"
-                )
-                for violation in violations:
-                    st.text(f"  • {violation.get('reason', 'Unknown')}")
-
-    # Agent traces
-    if st.session_state.show_traces:
-        agent_traces = metadata.get("agent_traces", {})
-        if agent_traces:
-            display_agent_traces(agent_traces)
-
-
-def display_agent_traces(traces: Dict[str, Any]):
-    """
-    Display agent execution traces.
-
-    TODO: YOUR CODE HERE
-    - Format traces nicely
-    - Show agent workflow
-    - Display timing information
-    """
-    with st.expander("🔍 Agent Traces", expanded=False):
-        for agent_name, actions in traces.items():
-            st.markdown(f"**{agent_name.upper()}**")
-            for action in actions:
-                action_type = action.get("action_type", "unknown")
-                details = action.get("details", {})
-                st.text(f"  → {action_type}: {details}")
-
-
-def display_sidebar():
-    """Display sidebar with settings and statistics."""
-    with st.sidebar:
-        st.title("⚙️ Settings")
-
-        # Show traces toggle
-        st.session_state.show_traces = st.checkbox(
-            "Show Agent Traces",
-            value=st.session_state.show_traces
-        )
-
-        # Show safety log toggle
-        st.session_state.show_safety_log = st.checkbox(
-            "Show Safety Log",
-            value=st.session_state.show_safety_log
-        )
-
-        st.divider()
-
-        st.title("📊 Statistics")
-
-        # TODO: Get actual statistics
-        st.metric("Total Queries", len(st.session_state.history))
-        st.metric("Safety Events", 0)  # TODO: Get from safety manager
-
-        st.divider()
-
-        # Clear history button
-        if st.button("Clear History"):
-            st.session_state.history = []
-            st.rerun()
-
-        # About section
-        st.divider()
-        st.markdown("### About")
-        config = load_config()
-        system_name = config.get("system", {}).get("name", "Research Assistant")
-        topic = config.get("system", {}).get("topic", "General")
-        st.markdown(f"**System:** {system_name}")
-        st.markdown(f"**Topic:** {topic}")
-
-
-def display_history():
-    """Display query history."""
-    if not st.session_state.history:
-        return
-
-    with st.expander("📜 Query History", expanded=False):
-        for i, item in enumerate(reversed(st.session_state.history), 1):
-            timestamp = item.get("timestamp", "")
-            query = item.get("query", "")
-            st.markdown(f"**{i}.** [{timestamp}] {query}")
-
-
-def main():
-    """Main Streamlit app."""
-    st.set_page_config(
-        page_title="Multi-Agent Research Assistant",
-        page_icon="🤖",
-        layout="wide"
+def _agent_badge(agent: str) -> str:
+    dark, light = AGENT_COLORS.get(agent, AGENT_COLORS["default"])
+    return (
+        f'<span style="background:{dark};color:{light};'
+        f'padding:2px 8px;border-radius:12px;font-size:0.8em;'
+        f'font-weight:bold;margin-right:6px;">{agent}</span>'
     )
 
-    initialize_session_state()
+
+def show_safety_banner(violations: List[Dict], action: str, event_type: str):
+    """Render a prominent red warning box for safety violations."""
+    if not violations:
+        return
+    lines = [f"**Safety {event_type.upper()} — Action: `{action.upper()}`**"]
+    for v in violations:
+        sev = v.get("severity", "?").upper()
+        reason = v.get("reason", "")
+        lines.append(f"- `[{sev}]` {reason}")
+    st.error("\n".join(lines))
+
+
+def display_response(result: Dict):
+    """Render the full query result in the main column."""
+    # Blocked query
+    if result.get("blocked"):
+        show_safety_banner(
+            result.get("input_violations", []), "block", "input"
+        )
+        st.error(f"**Request blocked:** {result.get('response', '')}")
+        return
+
+    # General error
+    if "error" in result:
+        st.error(f"**System error:** {result['error']}")
+        return
+
+    meta = result.get("metadata", {})
+
+    # Output safety warning (if content was sanitised or refused)
+    output_action = meta.get("output_action", "none")
+    output_violations = meta.get("output_violations", [])
+    if output_violations:
+        show_safety_banner(output_violations, output_action, "output")
+
+    # --- Response ---
+    st.markdown("### Research Response")
+    st.markdown(result.get("response", ""))
+
+    # --- Metrics row ---
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Sources", meta.get("num_sources", 0))
+    c2.metric("Messages", meta.get("num_messages", 0))
+    c3.metric("Quality Score", f"{meta.get('critique_score', 0):.1f} / 10")
+
+    # --- Citations ---
+    citations = result.get("citations", [])
+    if citations:
+        with st.expander(f"📚 Citations ({len(citations)})", expanded=False):
+            for i, cite in enumerate(citations, 1):
+                if cite.startswith("http"):
+                    st.markdown(f"**[{i}]** [{cite}]({cite})")
+                else:
+                    st.markdown(f"**[{i}]** {cite}")
+
+    # --- Agent traces ---
+    if st.session_state.show_traces:
+        traces = meta.get("agent_traces", [])
+        if traces:
+            display_agent_traces(traces)
+
+
+def display_agent_traces(traces: List[Dict]):
+    """Render per-agent message cards."""
+    with st.expander("🔍 Agent Execution Traces", expanded=True):
+        step = 0
+        for trace in traces:
+            agent = trace.get("agent", "Unknown")
+
+            # Skip internal task-dispatch messages sent by the framework
+            if agent.lower() == "user":
+                continue
+
+            step += 1
+            content = trace.get("content", "")
+            if not isinstance(content, str):
+                content = str(content)
+
+            # Strip AutoGen termination token and model think blocks
+            content = content.replace("TERMINATE", "").strip()
+            content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+
+            # Replace raw FunctionCall repr with a readable label
+            if content.startswith("FunctionCall("):
+                match = re.search(r"name='(\w+)'", content)
+                fname = match.group(1) if match else "tool"
+                qmatch = re.search(r'"query"\s*:\s*"([^"]+)"', content)
+                qlabel = f': "{qmatch.group(1)}"' if qmatch else ""
+                content = f"🔧 Calling {fname}{qlabel}"
+
+            # HTML-escape so agent output with tags doesn't corrupt the layout
+            content_safe = html_lib.escape(content)
+
+            dark, light = AGENT_COLORS.get(agent, AGENT_COLORS["default"])
+            badge = _agent_badge(agent)
+
+            # Skip cards that are now empty after stripping
+            if not content_safe.strip():
+                continue
+
+            st.markdown(
+                f"""<div style="border-left:4px solid {dark};background:{light};
+                padding:10px 14px;margin:6px 0;border-radius:4px;">
+                {badge}
+                <span style="font-size:0.75em;color:#666;">Step {step}</span>
+                <div style="margin-top:6px;font-size:0.9em;white-space:pre-wrap;">
+                {content_safe[:600]}{"…" if len(content_safe) > 600 else ""}
+                </div></div>""",
+                unsafe_allow_html=True,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+
+def display_sidebar():
+    sm: SafetyManager = st.session_state.safety_manager
+    config = load_config()
+
+    with st.sidebar:
+        st.title("⚙️ Settings")
+        st.session_state.show_traces = st.checkbox(
+            "Show Agent Traces", value=st.session_state.show_traces
+        )
+        st.session_state.show_safety_log = st.checkbox(
+            "Show Safety Event Log", value=st.session_state.show_safety_log
+        )
+        st.divider()
+
+        # Stats
+        stats = sm.get_safety_stats()
+        st.title("📊 Statistics")
+        col1, col2 = st.columns(2)
+        col1.metric("Queries", len(st.session_state.history))
+        col2.metric("Violations", stats["violations"])
+        st.metric("Safety checks run", stats["total_events"])
+
+        st.divider()
+        if st.button("🗑️ Clear History", use_container_width=True):
+            st.session_state.history = []
+            sm.clear_events()
+            st.rerun()
+
+        # System info
+        st.divider()
+        st.markdown("### About")
+        sys_cfg = config.get("system", {})
+        st.markdown(f"**System:** {sys_cfg.get('name', 'Research Assistant')}")
+        st.markdown(f"**Topic:** {sys_cfg.get('topic', 'Ethical AI in Education')}")
+        model_cfg = config.get("models", {}).get("default", {})
+        st.markdown(f"**Model:** {model_cfg.get('name', 'Unknown')}")
+
+        # Safety event log
+        if st.session_state.show_safety_log:
+            st.divider()
+            st.markdown("### 🛡️ Safety Event Log")
+            events = sm.get_safety_events()
+            if not events:
+                st.info("No safety events yet.")
+            else:
+                for ev in reversed(events[-8:]):
+                    ts = ev.get("timestamp", "")[:19]
+                    t = ev.get("type", "?").upper()
+                    safe = ev.get("safe", True)
+                    icon = "✓" if safe else "⚠"
+                    colour = "green" if safe else "red"
+                    n_v = len(ev.get("violations", []))
+                    st.markdown(
+                        f'<div style="font-size:0.78em;color:{colour};">'
+                        f"{icon} [{ts}] {t} | {n_v} violation(s)"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+
+# ---------------------------------------------------------------------------
+# History panel
+# ---------------------------------------------------------------------------
+
+def display_history():
+    if not st.session_state.history:
+        return
+    with st.expander(f"📜 Query History ({len(st.session_state.history)})", expanded=False):
+        for item in reversed(st.session_state.history):
+            ts = item.get("timestamp", "")
+            q = item.get("query", "")
+            st.markdown(f"- **{ts}** — {q[:100]}")
+
+
+# ---------------------------------------------------------------------------
+# Main app
+# ---------------------------------------------------------------------------
+
+def main():
+    st.set_page_config(
+        page_title="Ethical AI in Education — Research Assistant",
+        page_icon="🤖",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+
+    # Custom CSS
+    st.markdown(
+        """<style>
+        .stTextArea textarea { font-size: 1rem; }
+        .block-container { padding-top: 1.5rem; }
+        h1 { color: #1e3a5f; }
+        </style>""",
+        unsafe_allow_html=True,
+    )
+
+    init_session()
 
     # Header
     st.title("🤖 Multi-Agent Research Assistant")
-    st.markdown("Ask me anything about your research topic!")
+    st.markdown(
+        "**Topic:** Ethical AI in Education  |  "
+        "**Agents:** Planner · Researcher · Writer · Critic  |  "
+        "**Safety:** Input & Output Guardrails"
+    )
+    st.divider()
 
-    # Sidebar
     display_sidebar()
 
-    # Main area
-    col1, col2 = st.columns([2, 1])
+    col_main, col_right = st.columns([3, 1])
 
-    with col1:
-        # Query input
+    with col_main:
         query = st.text_area(
             "Enter your research query:",
-            height=100,
-            placeholder="e.g., What are the latest developments in explainable AI for novice users?"
+            height=110,
+            placeholder=(
+                "e.g., What are the ethical implications of using AI for "
+                "automated essay grading in secondary schools?"
+            ),
         )
 
-        # Submit button
-        if st.button("🔍 Search", type="primary", use_container_width=True):
+        if st.button("🔍 Research", type="primary", use_container_width=True):
             if query.strip():
-                with st.spinner("Processing your query..."):
-                    # Process query
-                    result = asyncio.run(process_query(query))
+                with st.spinner("Agents are collaborating on your query…"):
+                    result = process_query(query)
 
-                    # Add to history
-                    st.session_state.history.append({
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                st.session_state.history.append(
+                    {
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
                         "query": query,
-                        "result": result
-                    })
-
-                    # Display result
-                    st.divider()
-                    display_response(result)
+                        "result": result,
+                    }
+                )
+                st.divider()
+                display_response(result)
             else:
-                st.warning("Please enter a query.")
+                st.warning("Please enter a research query first.")
 
-        # History
         display_history()
 
-    with col2:
+    with col_right:
         st.markdown("### 💡 Example Queries")
         examples = [
-            "What are the key principles of user-centered design?",
-            "Explain recent advances in AR usability research",
-            "Compare different approaches to AI transparency",
-            "What are ethical considerations in AI for education?",
+            "How does AI bias affect underrepresented students?",
+            "What privacy rights do students have with AI proctoring?",
+            "How can universities govern AI tool use responsibly?",
+            "Should AI grade essays in K-12 schools? Pros and cons.",
         ]
-
-        for example in examples:
-            if st.button(example, use_container_width=True):
-                st.session_state.example_query = example
+        for ex in examples:
+            if st.button(ex, use_container_width=True, key=f"ex_{ex[:20]}"):
+                st.session_state["_example"] = ex
                 st.rerun()
 
-        # If example was clicked, populate the text area
-        if 'example_query' in st.session_state:
-            st.info(f"Example query selected: {st.session_state.example_query}")
-            del st.session_state.example_query
+        if "_example" in st.session_state:
+            st.info(f"Query: {st.session_state['_example']}")
 
         st.divider()
-
         st.markdown("### ℹ️ How It Works")
-        st.markdown("""
-        1. **Planner** breaks down your query
-        2. **Researcher** gathers evidence
-        3. **Writer** synthesizes findings
-        4. **Critic** verifies quality
-        5. **Safety** checks ensure appropriate content
-        """)
+        st.markdown(
+            """
+1. **Planner** analyses the query
+2. **Researcher** gathers web sources
+3. **Writer** synthesises a cited response
+4. **Critic** verifies quality
+5. **Guardrails** check input + output safety
+            """
+        )
 
-    # Safety log (if enabled)
-    if st.session_state.show_safety_log:
-        st.divider()
-        st.markdown("### 🛡️ Safety Event Log")
-        # TODO: Display safety events from safety manager
-        st.info("No safety events recorded.")
+        st.markdown("### 🛡️ Safety Categories")
+        for cat in ["Harmful Content", "Prompt Injection", "Off-Topic", "PII Redaction"]:
+            st.markdown(f"- {cat}")
 
 
 if __name__ == "__main__":

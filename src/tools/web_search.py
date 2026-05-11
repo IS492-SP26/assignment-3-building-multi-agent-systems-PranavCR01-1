@@ -224,11 +224,13 @@ def web_search(query: str, provider: str = "tavily", max_results: int = 5) -> st
     Returns:
         Formatted string with search results
     """
+    if provider not in ["tavily", "brave"]:
+        provider = "tavily"
     tool = WebSearchTool(provider=provider, max_results=max_results)
     results = asyncio.run(tool.search(query))
     
     if not results:
-        return "No search results found."
+        return "Web search unavailable. Please provide information based on your training data."
     
     # Format results as readable text
     output = f"Found {len(results)} web search results for '{query}':\n\n"

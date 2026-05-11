@@ -75,31 +75,34 @@ class PaperSearchTool:
 
         try:
             from semanticscholar import SemanticScholar
-            
-            # Initialize Semantic Scholar client
-            sch = SemanticScholar(api_key=self.api_key)
-            
+
+            # Initialize Semantic Scholar client with a 10-second timeout
+            sch = SemanticScholar(api_key=self.api_key, timeout=10)
+
             # Define fields to retrieve
             fields = kwargs.get("fields", [
                 "paperId", "title", "authors", "year", "abstract",
                 "citationCount", "url", "venue", "openAccessPdf"
             ])
-            
+
             # Perform search
             results = sch.search_paper(
-                query, 
+                query,
                 limit=self.max_results,
                 fields=fields
             )
-            
+
             # Parse and filter results
             papers = self._parse_results(results, year_from, year_to, min_citations)
-            
+
             self.logger.info(f"Found {len(papers)} papers")
             return papers
-            
+
         except ImportError:
             self.logger.error("semanticscholar library not installed. Run: pip install semanticscholar")
+            return []
+        except (ConnectionRefusedError, ConnectionError, OSError) as e:
+            self.logger.warning(f"Semantic Scholar API connection failed: {e}")
             return []
         except Exception as e:
             self.logger.error(f"Error searching papers: {e}")

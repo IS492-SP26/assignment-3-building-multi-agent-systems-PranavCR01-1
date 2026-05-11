@@ -18,28 +18,51 @@ from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_core.models import ModelFamily
 # Import our research tools
 from src.tools.web_search import web_search
-from src.tools.paper_search import paper_search
 
 
 def create_model_client(config: Dict[str, Any]) -> OpenAIChatCompletionClient:
     """
-    Create model client for AutoGen agents.
-    
+    Create the primary model client for Planner, Writer, and Critic agents.
+
+    Uses the vLLM endpoint (no tool calling required for these agents).
+    Falls back to Groq or OpenAI when provider is set accordingly in config.yaml.
+
     Args:
         config: Configuration dictionary from config.yaml
-        
+
     Returns:
         OpenAIChatCompletionClient configured for the specified provider
     """
     model_config = config.get("models", {}).get("default", {})
-    provider = model_config.get("provider", "groq")
-    
-    # Groq configuration (uses OpenAI-compatible API)
-    if provider == "groq":
+    provider = model_config.get("provider", "vllm")
+
+    if provider == "vllm":
+        api_key = os.getenv("OPENAI_API_KEY")
+        base_url = os.getenv("OPENAI_BASE_URL")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY not found in environment")
+
+        return OpenAIChatCompletionClient(
+            model=model_config.get("name", "Qwen/Qwen3-8B"),
+            api_key=api_key,
+            base_url=base_url,
+            # function_calling=False: vLLM at salt-lab does not have
+            # --enable-auto-tool-choice set, so tool calls must be avoided
+            # for this client.  Planner/Writer/Critic have no tools anyway.
+            model_info={
+                "vision": False,
+                "function_calling": False,
+                "json_output": False,
+                "family": ModelFamily.GPT_4O,
+                "structured_output": False,
+            },
+        )
+
+    elif provider == "groq":
         api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
             raise ValueError("GROQ_API_KEY not found in environment")
-        
+
         return OpenAIChatCompletionClient(
             model=model_config.get("name", "llama-3.3-70b-versatile"),
             api_key=api_key,
@@ -48,43 +71,53 @@ def create_model_client(config: Dict[str, Any]) -> OpenAIChatCompletionClient:
                 "json_output": False,
                 "vision": False,
                 "function_calling": True,
-            }
+            },
         )
-    
-    # OpenAI configuration
+
     elif provider == "openai":
         api_key = os.getenv("OPENAI_API_KEY")
         base_url = os.getenv("OPENAI_BASE_URL")
         if not api_key:
             raise ValueError("OPENAI_API_KEY not found in environment")
-        
+
         return OpenAIChatCompletionClient(
             model=model_config.get("name", "gpt-4o-mini"),
             api_key=api_key,
             base_url=base_url,
         )
 
-    elif provider == "vllm":
-        api_key = os.getenv("OPENAI_API_KEY")
-        base_url = os.getenv("OPENAI_BASE_URL")
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY not found in environment")
-        
-        return OpenAIChatCompletionClient(
-            model=model_config.get("name", "gpt-4o-mini"),
-            api_key=api_key,
-            base_url=base_url,
-            model_info={
-                "vision": False,
-                "function_calling": True,
-                "json_output": True,
-                "family": ModelFamily.GPT_4O,
-                "structured_output": True,
-            },
-        )
-    
     else:
         raise ValueError(f"Unsupported provider: {provider}")
+
+
+def create_groq_model_client(config: Dict[str, Any]) -> OpenAIChatCompletionClient:
+    """
+    Create a Groq model client exclusively for the Researcher agent.
+
+    The Researcher needs tool calling (web_search, paper_search).  The vLLM
+    endpoint at salt-lab does not expose tool-calling support, so the
+    Researcher uses Groq's llama-3.3-70b-versatile which fully supports it.
+
+    Args:
+        config: Configuration dictionary from config.yaml
+
+    Returns:
+        OpenAIChatCompletionClient pointed at Groq with function_calling=True
+    """
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise ValueError("GROQ_API_KEY not found in environment (needed for Researcher tools)")
+
+    return OpenAIChatCompletionClient(
+        model="llama-3.1-8b-instant",
+        api_key=api_key,
+        base_url="https://api.groq.com/openai/v1",
+        model_capabilities={
+            "json_output": False,
+            "vision": False,
+            "function_calling": True,
+        },
+    )
 
 
 def create_planner_agent(config: Dict[str, Any], model_client: OpenAIChatCompletionClient) -> AssistantAgent:
@@ -132,31 +165,30 @@ Be specific about what information to gather and why it's relevant."""
     return planner
 
 
-def create_researcher_agent(config: Dict[str, Any], model_client: OpenAIChatCompletionClient) -> AssistantAgent:
+def create_researcher_agent(config: Dict[str, Any], groq_model_client: OpenAIChatCompletionClient) -> AssistantAgent:
     """
     Create a Researcher Agent using AutoGen.
     
-    The researcher has access to web search and paper search tools.
+    The researcher has access to a web search tool.
     It gathers evidence based on the planner's guidance.
-    
+
     Args:
         config: Configuration dictionary
-        model_client: Model client for the agent
-        
+        groq_model_client: Groq model client (supports function calling for tools)
+
     Returns:
-        AutoGen AssistantAgent configured as a researcher with tool access
+        AutoGen AssistantAgent configured as a researcher with web search tool access
     """
     agent_config = config.get("agents", {}).get("researcher", {})
     
     # Load system prompt from config or use default
-    default_system_message = """You are a Research Assistant. Your job is to gather high-quality information from academic papers and web sources.
+    default_system_message = """You are a Research Assistant. Your job is to gather high-quality information from web sources.
 
-You have access to tools for web search and paper search. When conducting research:
-1. Use both web search and paper search for comprehensive coverage
-2. Look for recent, high-quality sources
-3. Extract key findings, quotes, and data
-4. Note all source URLs and citations
-5. Gather evidence that directly addresses the research query"""
+You have access to a web search tool. When conducting research:
+1. Use web search to find recent, high-quality sources
+2. Extract key findings, quotes, and data
+3. Note all source URLs
+4. Gather evidence that directly addresses the research query"""
 
     # Use custom prompt from config if available
     custom_prompt = agent_config.get("system_prompt", "")
@@ -170,17 +202,12 @@ You have access to tools for web search and paper search. When conducting resear
         web_search,
         description="Search the web for articles, blog posts, and general information. Returns formatted search results with titles, URLs, and snippets."
     )
-    
-    paper_search_tool = FunctionTool(
-        paper_search,
-        description="Search academic papers on Semantic Scholar. Returns papers with authors, abstracts, citation counts, and URLs. Use year_from parameter to filter recent papers."
-    )
 
-    # Create the researcher with tool access
+    # Create the researcher with tool access (uses Groq client for tool calling)
     researcher = AssistantAgent(
         name="Researcher",
-        model_client=model_client,
-        tools=[web_search_tool, paper_search_tool],
+        model_client=groq_model_client,
+        tools=[web_search_tool],
         description="Gathers evidence from web and academic sources using search tools",
         system_message=system_message,
     )
@@ -289,12 +316,14 @@ def create_research_team(config: Dict[str, Any]) -> RoundRobinGroupChat:
     Returns:
         RoundRobinGroupChat with all agents configured
     """
-    # Create model client (shared by all agents)
+    # vLLM client for Planner, Writer, Critic (no tool calling needed)
     model_client = create_model_client(config)
-    
+    # Groq client for Researcher only (tool calling required)
+    groq_model_client = create_groq_model_client(config)
+
     # Create all agents
     planner = create_planner_agent(config, model_client)
-    researcher = create_researcher_agent(config, model_client)
+    researcher = create_researcher_agent(config, groq_model_client)
     writer = create_writer_agent(config, model_client)
     critic = create_critic_agent(config, model_client)
     

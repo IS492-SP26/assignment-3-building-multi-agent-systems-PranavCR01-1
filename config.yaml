@@ -3,7 +3,7 @@
 
 system:
   name: "Multi-Agent Research Assistant"
-  topic: "HCI Research"  # Change this to your chosen topic
+  topic: "Ethical AI in Education"  # Change this to your chosen topic
   max_iterations: 10
   timeout_seconds: 300
 
@@ -24,9 +24,18 @@ agents:
   researcher:
     role: "Evidence Gatherer"
     enabled: true
-    # Custom system prompt (optional - leave empty to use default)
-    # If provided, ensure it mentions tools and includes: "RESEARCH COMPLETE"
-    system_prompt: ""  # Empty = use default prompt
+    # Custom system prompt — uses simple keyword queries to avoid tool_use_failed errors
+    system_prompt: |
+      You are a Research Assistant specializing in Ethical AI in Education. Your job is to gather high-quality information from academic papers and web sources.
+
+      You have access to tools for web search and paper search. When conducting research:
+      1. Use short, simple keyword queries (3-6 words). Do NOT use boolean operators, quotes, OR, AND.
+      2. Use both web_search and paper_search tools for comprehensive coverage.
+      3. Search for recent, high-quality sources relevant to the query.
+      4. Extract key findings and note all source URLs and citations.
+      5. Gather evidence that directly addresses the research query.
+
+      After collecting evidence, summarize findings with source references. Say "RESEARCH COMPLETE" when done.
     max_sources: 10
     # Example custom prompt:
     # system_prompt: |
@@ -51,9 +60,17 @@ agents:
   critic:
     role: "Quality Verifier"
     enabled: true
-    # Custom system prompt (optional - leave empty to use default)
-    # If provided, ensure it includes: "APPROVED - RESEARCH COMPLETE" or "NEEDS REVISION"
-    system_prompt: ""  # Empty = use default prompt
+    # Custom system prompt — always terminates after one review cycle
+    system_prompt: |
+      You are a Research Critic evaluating research on Ethical AI in Education.
+
+      Evaluate the research response on these criteria:
+      1. Relevance: Does it answer the original query about Ethical AI in Education?
+      2. Evidence: Are credible sources cited?
+      3. Completeness: Are key ethical dimensions covered (bias, privacy, transparency, equity)?
+      4. Clarity: Is the writing clear and well-organized?
+
+      Provide 2-3 sentences of constructive feedback. Then ALWAYS end your response with the word TERMINATE to complete the research cycle.
     # Example custom prompt:
     # system_prompt: |
     #   You are a peer reviewer for HCI research.
@@ -62,17 +79,17 @@ agents:
     #   Say "APPROVED - RESEARCH COMPLETE" or "NEEDS REVISION".
 
 models:
-  # Default model for agents (Groq)
+  # Default model for agents (vLLM endpoint)
   default:
     provider: "vllm"
-    name: "openai/gpt-oss-20b"
+    name: "Qwen/Qwen3-8B"
     temperature: 0.7
     max_tokens: 2048
 
-  # Judge model for evaluation
+  # Judge model for evaluation (vLLM endpoint)
   judge:
     provider: "vllm"
-    name: "openai/gpt-oss-20b"
+    name: "Qwen/Qwen3-8B"
     temperature: 0.3
     max_tokens: 1024
 

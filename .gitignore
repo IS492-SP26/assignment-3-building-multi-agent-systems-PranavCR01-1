@@ -215,3 +215,4 @@ data/*.csv
 outputs/
 *.pkl
 *.pickle
+".claude" 
